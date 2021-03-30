@@ -27,6 +27,7 @@ module Bitcoin
 
     COMPACT_SIGNATURE_LENGTH = 64
 
+    GROUP_FIELD = OpenSSL::BN.new "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16
 
     attach_function :RAND_poll, [], :int
 
@@ -97,6 +98,22 @@ module Bitcoin
       [priv_hex, key.public_key.to_bn.to_s(16).downcase]
     end
 
+    def self.ffi_bn_to_bn(bn)
+      num_b = BN_num_bytes(bn)
+      buf = FFI::MemoryPointer.new(:uint8, num_b)
+      BN_bn2bin(bn, buf)
+      value = buf.read_string(num_b).rjust(32, "\x00")
+      OpenSSL::BN.new value, 2
+    end
+
+    def self.from_compressed_point(group, x, is_even)
+      x_value = x.to_s(2).rjust(32, "\x00")
+      prefix = is_even ? "\x02" : "\x03"
+
+      encoded = OpenSSL::BN.new [ prefix, x_value ].join, 2
+      OpenSSL::PKey::EC::Point.new(group, encoded)
+    end
+
     # Given the components of a signature and a selector value, recover and
     # return the public key that generated the signature according to the
     # algorithm in SEC1v2 section 4.1.6.
@@ -121,65 +138,35 @@ module Bitcoin
     def self.recover_public_key_from_signature(message_hash, signature, rec_id, is_compressed)
       return nil if rec_id < 0 || signature.bytesize != 65
 
-      signature = FFI::MemoryPointer.from_string(signature)
-      # signature_bn = BN_bin2bn(signature, 65, BN_new())
-      r = BN_bin2bn(signature[1], 32, BN_new())
-      s = BN_bin2bn(signature[33], 32, BN_new())
+      signature = signature.dup.force_encoding Encoding::BINARY
+      hash = message_hash.dup.force_encoding(Encoding::BINARY).ljust(32, "\0")
+
+      r = OpenSSL::BN.new signature[1..32], 2
+      s = OpenSSL::BN.new signature[33..64], 2
 
       i = rec_id / 2
-      eckey = EC_KEY_new_by_curve_name(NID_secp256k1)
+      eckey = OpenSSL::PKey::EC.new GROUP_NAME
+      eckey.group.point_conversion_form = :compressed if is_compressed
 
-      EC_KEY_set_conv_form(eckey, POINT_CONVERSION_COMPRESSED) if is_compressed
+      group = OpenSSL::PKey::EC::Group.new GROUP_NAME
+      x = group.order.dup
+      x *= i
+      x += r
 
-      group = EC_KEY_get0_group(eckey)
-      order = BN_new()
-      EC_GROUP_get_order(group, order, nil)
-      x = BN_dup(order)
-      BN_mul_word(x, i)
-      BN_add(x, x, r)
+      return nil if x >= GROUP_FIELD
 
-      field = BN_new()
-      EC_GROUP_get_curve_GFp(group, field, nil, nil, nil)
+      big_r = from_compressed_point(group, x, rec_id.even?)
+      n = group.degree.dup
+      e = OpenSSL::BN.new hash, 2
+      e = e >> (8 - (n & 7)) if 8 * message_hash.bytesize > n
 
-      if BN_cmp(x, field) >= 0
-        [r, s, order, x, field].each { |item| BN_free(item) }
-        EC_KEY_free(eckey)
-        return nil
-      end
+      e = 0.to_bn.mod_sub(e, group.order)
+      rr = r.mod_inverse(group.order)
+      sor = s.mod_mul(rr, group.order)
+      eor = e.mod_mul(rr, group.order)
+      big_q = big_r.mul(sor, eor)
 
-      big_r = EC_POINT_new(group)
-      EC_POINT_set_compressed_coordinates_GFp(group, big_r, x, rec_id % 2, nil)
-
-      big_q = EC_POINT_new(group)
-      n = EC_GROUP_get_degree(group)
-      e = BN_bin2bn(message_hash, message_hash.bytesize, BN_new())
-      BN_rshift(e, e, 8 - (n & 7)) if 8 * message_hash.bytesize > n
-
-      ctx = BN_CTX_new()
-      zero = BN_new()
-      rr = BN_new()
-      sor = BN_new()
-      eor = BN_new()
-      BN_set_word(zero, 0)
-      BN_mod_sub(e, zero, e, order, ctx)
-      BN_mod_inverse(rr, r, order, ctx)
-      BN_mod_mul(sor, s, rr, order, ctx)
-      BN_mod_mul(eor, e, rr, order, ctx)
-      EC_POINT_mul(group, big_q, eor, big_r, sor, ctx)
-      EC_KEY_set_public_key(eckey, big_q)
-      BN_CTX_free(ctx)
-
-      [r, s, order, x, field, e, zero, rr, sor, eor].each { |item| BN_free(item) }
-      [big_r, big_q].each { |item| EC_POINT_free(item) }
-
-      length = i2o_ECPublicKey(eckey, nil)
-      buf = FFI::MemoryPointer.new(:uint8, length)
-      ptr = FFI::MemoryPointer.new(:pointer).put_pointer(0, buf)
-      pub_hex = buf.read_string(length).unpack('H*')[0] if i2o_ECPublicKey(eckey, ptr) == length
-
-      EC_KEY_free(eckey)
-
-      pub_hex
+      big_q.to_bn(is_compressed ? :compressed : :uncompressed).to_s(16).downcase
     end
 
     def self.bn_abs(bn)
@@ -223,6 +210,7 @@ module Bitcoin
 
     def self.sign_compact(hash, private_key, public_key_hex = nil, pubkey_compressed = nil)
       msg32 = FFI::MemoryPointer.new(:uchar, 32).put_bytes(0, hash)
+      new_hash = hash.dup.force_encoding(Encoding::BINARY).ljust(32, "\0")
 
       private_key = [private_key].pack('H*') if private_key.bytesize >= 64
       private_key_hex = private_key.unpack('H*')[0]
@@ -316,7 +304,7 @@ module Bitcoin
         raise EncodingError, 'element is negative' if value.value.negative?
       end
 
-      parsed_sig
+      [ parsed_sig.value[0].value, parsed_sig.value[1].value ]
     end
 
     # repack signature for OpenSSL 1.0.1k handling of DER signatures

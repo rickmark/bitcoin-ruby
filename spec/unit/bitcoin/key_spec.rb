@@ -140,7 +140,11 @@ describe Bitcoin::Key do
       key = Bitcoin::Key.recover_compact_signature_to_key(
         test[:message], test[:signature]
       )
-      expect(key.addr == test[:address]).to eq(test[:expected])
+      if test[:expected]
+        expect(key.addr).to eql(test[:address])
+      else
+        expect(key.addr).to_not eql(test[:address])
+      end
     end
   end
 
