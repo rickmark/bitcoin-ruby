@@ -23,6 +23,8 @@ module Bitcoin
     POINT_CONVERSION_COMPRESSED = 2
     POINT_CONVERSION_UNCOMPRESSED = 4
 
+    GROUP_NAME = 'secp256k1'
+
 
     attach_function :RAND_poll, [], :int
 
@@ -80,7 +82,7 @@ module Bitcoin
       private_key = [private_key].pack('H*') if private_key.bytesize >= (32 * 2)
       private_key_hex = private_key.unpack('H*')[0]
 
-      group = OpenSSL::PKey::EC::Group.new('secp256k1')
+      group = OpenSSL::PKey::EC::Group.new GROUP_NAME
       key = OpenSSL::PKey::EC.new(group)
       key.private_key = OpenSSL::BN.new(private_key_hex, 16)
       key.public_key = group.generator.mul(key.private_key)
@@ -181,44 +183,27 @@ module Bitcoin
     # Regenerate a DER-encoded signature such that the S-value complies with the BIP62
     # specification.
     #
-    def self.signature_to_low_s(signature)
-      buf = FFI::MemoryPointer.new(:uint8, 34)
-      temp = signature.unpack('C*')
-      length_r = temp[3]
-      length_s = temp[5 + length_r]
-      sig = FFI::MemoryPointer.from_string(signature)
+    def self.signature_to_low_s(signature_data)
+      signature = OpenSSL::ASN1.decode signature_data
 
       # Calculate the lower s value
-      s = BN_bin2bn(sig[6 + length_r], length_s, BN_new())
-      eckey = EC_KEY_new_by_curve_name(NID_secp256k1)
-      group = EC_KEY_get0_group(eckey)
-      order = BN_new()
-      halforder = BN_new()
-      ctx = BN_CTX_new()
+      r = OpenSSL::BN.new signature.value[0].value
+      s = OpenSSL::BN.new signature.value[1].value
 
-      EC_GROUP_get_order(group, order, ctx)
-      BN_rshift1(halforder, order)
-      BN_sub(s, order, s) if BN_cmp(s, halforder) > 0
+      group = OpenSSL::PKey::EC::Group.new(GROUP_NAME)
 
-      BN_free(halforder)
-      BN_free(order)
-      BN_CTX_free(ctx)
+      half_order = group.order >> 1
 
-      length_s = BN_bn2bin(s, buf)
-      # p buf.read_string(length_s).unpack("H*")
+      s -= group.order if s > half_order
 
-      # Re-encode the signature in DER format
-      sig = [0x30, 0, 0x02, length_r]
-      sig.concat(temp.slice(4, length_r))
-      sig << 0x02
-      sig << length_s
-      sig.concat(buf.read_string(length_s).unpack('C*'))
-      sig[1] = sig.size - 2
+      encode_der_signature(r, s)
+    end
 
-      BN_free(s)
-      EC_KEY_free(eckey)
+    def self.encode_der_signature(r_value, s_value)
+      signature = OpenSSL::ASN1::Sequence.new([OpenSSL::ASN1::Integer.new(r_value),
+                                               OpenSSL::ASN1::Integer.new(s_value)])
 
-      sig.pack('C*')
+      signature.to_der
     end
 
     def self.sign_compact(hash, private_key, public_key_hex = nil, pubkey_compressed = nil)
