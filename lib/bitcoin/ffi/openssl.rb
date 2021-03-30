@@ -1,6 +1,7 @@
 # encoding: ascii-8bit
 
 require 'ffi'
+require 'openssl'
 
 module Bitcoin
   # autoload when you need to re-generate a public_key from only its private_key.
@@ -13,6 +14,7 @@ module Bitcoin
       ffi_lib [
         'libssl.so.1.1.0', 'libssl.so.1.1',
         'libssl.so.1.0.0', 'libssl.so.10',
+        '/Users/rickmark/.rbenv/versions/3.0.0/openssl/lib/libssl.1.1.dylib',
         'ssl'
       ]
     end
@@ -21,56 +23,6 @@ module Bitcoin
     POINT_CONVERSION_COMPRESSED = 2
     POINT_CONVERSION_UNCOMPRESSED = 4
 
-    # OpenSSL 1.1.0 version as a numerical version value as defined in:
-    # https://www.openssl.org/docs/man1.1.0/man3/OpenSSL_version.html
-    VERSION_1_1_0_NUM = 0x10100000
-
-    # OpenSSL 1.1.0 engine constants, taken from:
-    # https://github.com/openssl/openssl/blob/2be8c56a39b0ec2ec5af6ceaf729df154d784a43/include/openssl/crypto.h
-    OPENSSL_INIT_ENGINE_RDRAND = 0x00000200
-    OPENSSL_INIT_ENGINE_DYNAMIC = 0x00000400
-    OPENSSL_INIT_ENGINE_CRYPTODEV = 0x00001000
-    OPENSSL_INIT_ENGINE_CAPI = 0x00002000
-    OPENSSL_INIT_ENGINE_PADLOCK = 0x00004000
-    OPENSSL_INIT_ENGINE_ALL_BUILTIN = (
-      OPENSSL_INIT_ENGINE_RDRAND |
-      OPENSSL_INIT_ENGINE_DYNAMIC |
-      OPENSSL_INIT_ENGINE_CRYPTODEV |
-      OPENSSL_INIT_ENGINE_CAPI |
-      OPENSSL_INIT_ENGINE_PADLOCK
-    )
-
-    # OpenSSL 1.1.0 load strings constant, taken from:
-    # https://github.com/openssl/openssl/blob/c162c126be342b8cd97996346598ecf7db56130f/include/openssl/ssl.h
-    OPENSSL_INIT_LOAD_SSL_STRINGS = 0x00200000
-
-    # This is the very first function we need to use to determine what version
-    # of OpenSSL we are interacting with.
-    begin
-      attach_function :OpenSSL_version_num, [], :ulong
-    rescue FFI::NotFoundError
-      attach_function :SSLeay, [], :long
-    end
-
-    # Returns the version of SSL present.
-    #
-    # @return [Integer] version number as an integer.
-    def self.version
-      if self.respond_to?(:OpenSSL_version_num)
-        OpenSSL_version_num()
-      else
-        SSLeay()
-      end
-    end
-
-    if version >= VERSION_1_1_0_NUM
-      # Initialization procedure for the library was changed in OpenSSL 1.1.0
-      attach_function :OPENSSL_init_ssl, [:uint64, :pointer], :int
-    else
-      attach_function :SSL_library_init, [], :int
-      attach_function :ERR_load_crypto_strings, [], :void
-      attach_function :SSL_load_error_strings, [], :void
-    end
 
     attach_function :RAND_poll, [], :int
 
@@ -164,7 +116,6 @@ module Bitcoin
     #   is_compressed = whether or not the original pubkey was compressed.
     def self.recover_public_key_from_signature(message_hash, signature, rec_id, is_compressed)
       return nil if rec_id < 0 || signature.bytesize != 65
-      init_ffi_ssl
 
       signature = FFI::MemoryPointer.from_string(signature)
       # signature_bn = BN_bin2bn(signature, 65, BN_new())
@@ -231,8 +182,6 @@ module Bitcoin
     # specification.
     #
     def self.signature_to_low_s(signature)
-      init_ffi_ssl
-
       buf = FFI::MemoryPointer.new(:uint8, 34)
       temp = signature.unpack('C*')
       length_r = temp[3]
@@ -281,7 +230,6 @@ module Bitcoin
       public_key_hex ||= regenerate_key(private_key_hex).last
       pubkey_compressed ||= public_key_hex[0..1] != '04'
 
-      init_ffi_ssl
       eckey = EC_KEY_new_by_curve_name(NID_secp256k1)
       priv_key = BN_bin2bn(private_key, private_key.bytesize, BN_new())
 
@@ -343,30 +291,22 @@ module Bitcoin
     end
 
     # lifted from https://github.com/GemHQ/money-tree
-    def self.ec_add(point0, point1)
-      init_ffi_ssl
+    def self.ec_add(point_0, point_1)
+      group = OpenSSL::PKey::EC::Group.new('secp256k1')
 
-      eckey = EC_KEY_new_by_curve_name(NID_secp256k1)
-      group = EC_KEY_get0_group(eckey)
+      point_0_hex = point_0.to_bn.to_s(16)
+      point_0_pt = OpenSSL::PKey::EC::Point.new(group, OpenSSL::BN.new(point_0_hex, 16))
+      point_1_hex = point_1.to_bn.to_s(16)
+      point_1_pt = OpenSSL::PKey::EC::Point.new(group, OpenSSL::BN.new(point_1_hex, 16))
 
-      point_0_hex = point0.to_bn.to_s(16)
-      point_0_pt = EC_POINT_hex2point(group, point_0_hex, nil, nil)
-      point_1_hex = point1.to_bn.to_s(16)
-      point_1_pt = EC_POINT_hex2point(group, point_1_hex, nil, nil)
+      sum_point = point_0_pt.add(point_1_pt)
 
-      sum_point = EC_POINT_new(group)
-      EC_POINT_add(group, sum_point, point_0_pt, point_1_pt, nil)
-      hex = EC_POINT_point2hex(group, sum_point, POINT_CONVERSION_UNCOMPRESSED, nil)
-      EC_KEY_free(eckey)
-      EC_POINT_free(sum_point)
-      hex
+      sum_point.to_bn.to_s(16)
     end
 
     # repack signature for OpenSSL 1.0.1k handling of DER signatures
     # https://github.com/bitcoin/bitcoin/pull/5634/files
     def self.repack_der_signature(signature)
-      init_ffi_ssl
-
       return false if signature.empty?
 
       # New versions of OpenSSL will reject non-canonical DER signatures. de/re-serialize first.
@@ -385,25 +325,6 @@ module Bitcoin
       OPENSSL_free(norm_der.read_pointer)
 
       ret
-    end
-
-    def self.init_ffi_ssl
-      @ssl_loaded ||= false
-      return if @ssl_loaded
-
-      if version >= VERSION_1_1_0_NUM
-        OPENSSL_init_ssl(
-          OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_ENGINE_ALL_BUILTIN,
-          nil
-        )
-      else
-        SSL_library_init()
-        ERR_load_crypto_strings()
-        SSL_load_error_strings()
-      end
-
-      RAND_poll()
-      @ssl_loaded = true
     end
   end
 end
