@@ -25,6 +25,8 @@ module Bitcoin
 
     GROUP_NAME = 'secp256k1'
 
+    COMPACT_SIGNATURE_LENGTH = 64
+
 
     attach_function :RAND_poll, [], :int
 
@@ -180,6 +182,16 @@ module Bitcoin
       pub_hex
     end
 
+    def self.bn_abs(bn)
+      raise ArgumentError unless bn.is_a?(OpenSSL::BN)
+
+      if bn.negative?
+        -bn
+      else
+        bn
+      end
+    end
+
     # Regenerate a DER-encoded signature such that the S-value complies with the BIP62
     # specification.
     #
@@ -189,6 +201,9 @@ module Bitcoin
       # Calculate the lower s value
       r = OpenSSL::BN.new signature.value[0].value
       s = OpenSSL::BN.new signature.value[1].value
+
+      raise EncodingError, 'r_value negative' if r.negative?
+      raise EncodingError, 's_value negative' if s.negative?
 
       group = OpenSSL::PKey::EC::Group.new(GROUP_NAME)
 
@@ -277,7 +292,7 @@ module Bitcoin
 
     # lifted from https://github.com/GemHQ/money-tree
     def self.ec_add(point_0, point_1)
-      group = OpenSSL::PKey::EC::Group.new('secp256k1')
+      group = OpenSSL::PKey::EC::Group.new(GROUP_NAME)
 
       point_0_hex = point_0.to_bn.to_s(16)
       point_0_pt = OpenSSL::PKey::EC::Point.new(group, OpenSSL::BN.new(point_0_hex, 16))
@@ -287,6 +302,21 @@ module Bitcoin
       sum_point = point_0_pt.add(point_1_pt)
 
       sum_point.to_bn.to_s(16)
+    end
+
+    def self.assert_asn1_signature(data)
+      parsed_sig = OpenSSL::ASN1.decode data
+
+      raise EncodingError, 'not an ASN1 sequence' unless parsed_sig.is_a?(OpenSSL::ASN1::Sequence)
+      raise EncodingError, 'does not contain two items' unless parsed_sig.value.size == 2
+
+      parsed_sig.value do |value|
+        raise EncodingError, 'element is not an integer' unless value.is_a?(OpenSSL::ASN1::Integer)
+        raise EncodingError, 'element integer is not a BN' unless value.value.is_a?(OpenSSL::BN)
+        raise EncodingError, 'element is negative' if value.value.negative?
+      end
+
+      parsed_sig
     end
 
     # repack signature for OpenSSL 1.0.1k handling of DER signatures
@@ -308,6 +338,8 @@ module Bitcoin
 
       ret = norm_der.read_pointer.read_string(derlen)
       OPENSSL_free(norm_der.read_pointer)
+
+      assert_asn1_signature ret
 
       ret
     end
